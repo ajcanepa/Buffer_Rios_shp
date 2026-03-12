@@ -47,3 +47,9 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Lectura desde API
+Descarga_usando_API.R
+
+# Datos Acceso
+PAT_Number.txt
