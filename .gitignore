@@ -53,3 +53,12 @@ Descarga_usando_API.R
 
 # Datos Acceso
 PAT_Number.txt
+
+# Silenciar los datos grandes de entrada
+*.shp
+*.dbf
+*.shx
+*.prj
+*.cpg
+*.kmz
+*.kml
