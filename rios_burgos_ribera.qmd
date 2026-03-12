@@ -1,0 +1,503 @@
+---
+title: "Zonas de Ribera en Burgos: Ríos Arlanzón, Vena y Ubierna"
+subtitle: "Flujo de trabajo GIS en R — Shapefile IGN/CNIG → Buffer 60 m → KMZ"
+author: "Antonio Canepa"
+date: today
+lang: es
+
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contenido"
+    number-sections: true
+    code-fold: false
+    code-tools: true
+    theme: cosmo
+    highlight-style: github
+    self-contained: true
+  pdf:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    colorlinks: true
+    documentclass: article
+    geometry: margin=2.5cm
+    highlight-style: github
+  gfm:
+    toc: true
+    toc-depth: 3
+    output-file: README.md
+
+execute:
+  eval: true       # Ponlo en TRUE si tienes el shapefile en local
+  echo: true
+  warning: false
+  message: false
+
+knitr:
+  opts_chunk:
+    comment: "#>"
+---
+
+# Introducción
+
+Este documento describe paso a paso un flujo de trabajo completo en **R** para:
+
+1. Leer un **shapefile** de la red hidrográfica descargado del IGN/CNIG.
+2. Filtrar los cauces del **Río Arlanzón**, **Río Vena** y **Río Ubierna** dentro de la provincia de Burgos.
+3. Aplicar un **buffer de 60 metros** para delimitar la zona de ribera.
+4. Disolver y reproyectar la capa resultante.
+5. Exportar el resultado final a formato **KMZ** (Google Earth / QGIS).
+
+> **Nota:** El parámetro `eval: false` en el encabezado YAML desactiva la ejecución
+> automática del código al renderizar. Cámbialo a `eval: true` una vez que el
+> shapefile esté disponible en las rutas indicadas.
+
+---
+
+## Fuentes de datos
+
+Los shapefiles de hidrografía pueden descargarse desde:
+
+- [MíRAme CHD — Confederación Hidrográfica del Duero](https://mirame.chduero.es/chduero/viewer)
+- [Centro de Descargas del CNIG (IGN)](https://centrodedescargas.cnig.es/CentroDescargas/hidrografia)
+- [MITECO — Red Hidrográfica](https://www.miteco.gob.es/es/cartografia-y-sig/ide/descargas/agua/red-hidrografica.html)
+
+---
+
+# Librerías necesarias {#sec-librerias}
+
+Se utilizan tres paquetes fundamentales:
+
+| Paquete      | Función principal en este flujo                                          |
+|:-------------|:-------------------------------------------------------------------------|
+| `sf`         | Lectura, reproyección, buffer y exportación de datos vectoriales (OGC)   |
+| `tidyverse`  | Filtrado, selección y mutación de tablas de atributos con verbos dplyr   |
+| `zip`        | Compresión del archivo KML generado en un contenedor KMZ                 |
+
+```{r}
+#| label: librerias
+
+library(sf)        # Lectura, manipulación y exportación de datos espaciales
+library(tidyverse) # Filtrado y manipulación de tablas de atributos
+library(zip)       # Compresión del KML en KMZ
+```
+
+---
+
+# Configuración de rutas {#sec-rutas}
+
+Define la **ruta local** al shapefile descomprimido. El nombre del archivo varía
+según el producto descargado:
+
+| Producto IGN          | Nombre típico del .shp                      |
+|:----------------------|:--------------------------------------------|
+| IGR Hidrografía INSPIRE | `HY_PhysicalWaters_Watercourses.shp`      |
+| BTN25                 | `HID_Hidrografia_Cauce.shp`                 |
+| BCN200                | `hidrografia_l.shp`                         |
+| CHD (Duero)           | `Duero_Rios_Duero_YYYYMMDD.shp`             |
+
+```{r}
+#| label: rutas
+
+# CAMBIA esta ruta por la ubicación real en tu equipo:
+ruta_shp <- "Duero_Rios_Duero_20260312/Duero_Rios_Duero_20260312.shp"
+
+# Alternativa BTN25:
+# ruta_shp <- "C:/datos/btn25/HID_Hidrografia_Cauce.shp"
+```
+
+---
+
+# Exploración previa del shapefile {#sec-exploracion}
+
+Antes de filtrar, inspeccionamos el shapefile para identificar:
+
+- El **nombre exacto** de la columna que contiene los nombres de los ríos.
+- El **formato tipográfico** de los nombres (tildes, mayúsculas, prefijos, etc.).
+
+La clave es el argumento `query =` de `st_read()`, que acepta SQL estándar
+(`SELECT ... LIMIT 20`) y evita cargar el archivo completo en memoria — muy útil
+cuando el shapefile pesa varios cientos de megabytes.
+
+```{r}
+#| label: exploracion
+
+# Leemos solo las primeras 20 filas usando SQL
+cabecera <- st_read(
+  ruta_shp,
+  query = 'SELECT * FROM "Duero_Rios_Duero_20260312" LIMIT 20'
+)
+
+# Columnas disponibles
+cat("Columnas disponibles en el Shapefile:\n")
+print(names(cabecera))
+
+# Muestra de nombres de ríos
+cat("\nMuestra de nombres de ríos:\n")
+print(head(cabecera$nombre, 20))
+```
+
+---
+
+# Identificar la columna de nombres {#sec-col-nombre}
+
+Según el producto descargado, la columna con el nombre del río puede llamarse de
+forma diferente. Asignamos su nombre a la variable `col_nombre` para usarla
+dinámicamente en los pasos posteriores con `.data[[col_nombre]]`.
+
+| Producto              | Nombre de columna habitual |
+|:----------------------|:---------------------------|
+| IGR Hidrografía       | `localname` o `nombre`     |
+| BTN25                 | `NOMBRE`                   |
+| MITECO                | `NOM_RIO`                  |
+| OpenStreetMap         | `name`                     |
+
+```{r}
+#| label: col-nombre
+
+col_nombre <- "nombre"  # <-- AJUSTA según tu shapefile
+```
+
+---
+
+# Lectura del shapefile {#sec-lectura}
+
+Leemos el shapefile completo con `st_read()`. En el código original, el filtro
+espacial por bounding box de Burgos está comentado para mayor flexibilidad; puede
+reactivarse (líneas con `wkt_filter`) para ahorrar memoria cuando el dataset
+cubre toda España.
+
+El filtro WKT define un rectángulo que envuelve la provincia de Burgos:
+
+```
+POLYGON((-4.10 41.80, -2.90 41.80, -2.90 43.00, -4.10 43.00, -4.10 41.80))
+```
+
+```{r}
+#| label: lectura
+
+# Bounding box de Burgos como WKT (opcional, descomenta para activar)
+# bbox_burgos_wkt <- "POLYGON((-4.10 41.80, -2.90 41.80, -2.90 43.00,
+#                              -4.10 43.00, -4.10 41.80))"
+
+message(">>> Leyendo shapefile...")
+Rios_Burgos <- hidrografia_burgos <- st_read(ruta_shp)
+# Con filtro espacial:
+# Rios_Burgos <- st_read(ruta_shp, wkt_filter = bbox_burgos_wkt)
+
+message(">>> Elementos cargados: ", nrow(Rios_Burgos))
+
+# cat("\nRíos disponibles en la zona de Burgos:\n")
+# print(sort(unique(Rios_Burgos[[col_nombre]])))
+```
+
+---
+
+# Filtrado de los tres ríos {#sec-filtrado}
+
+Usamos `grepl()` con `ignore.case = TRUE` para una búsqueda robusta que no
+depende de mayúsculas ni tildes exactas. El operador `|` dentro de `filter()`
+selecciona cualquier fila que coincida con al menos uno de los tres patrones.
+
+```{r}
+#| label: filtrado
+
+rios_interes <-
+  Rios_Burgos %>%
+  filter(
+    grepl("Río Arlanzón", .data[[col_nombre]], ignore.case = TRUE) |
+    grepl("Río Vena",     .data[[col_nombre]], ignore.case = TRUE) |
+    grepl("Río Ubierna",  .data[[col_nombre]], ignore.case = TRUE)
+  )
+
+message(">>> Segmentos encontrados: ", nrow(rios_interes))
+
+cat("\nRíos filtrados:\n")
+print(table(rios_interes[[col_nombre]]))
+```
+
+---
+
+# Limpieza de columnas {#sec-limpieza}
+
+Conservamos únicamente las columnas imprescindibles (`nombre` y `geometry`) para
+reducir el peso del objeto en memoria y simplificar los pasos posteriores.
+
+```{r}
+#| label: limpieza
+
+rios_limpios <- rios_interes %>%
+  select(nombre, geometry)
+```
+
+---
+
+# Reproyección a UTM zona 30N {#sec-reproyeccion-utm}
+
+Los buffers en metros exigen un **sistema de coordenadas proyectado**. El
+estándar oficial para España peninsular es **EPSG:25830** (ETRS89 / UTM zona 30N).
+Proyectar sobre datos geográficos (grados) generaría distancias incorrectas.
+
+```{r}
+#| label: reproyeccion-utm
+
+cat("\nCRS original del shapefile:\n")
+print(st_crs(rios_limpios))
+
+rios_utm <- st_transform(rios_limpios, crs = 25830)
+message(">>> Reproyectado a EPSG:25830 (ETRS89 / UTM zona 30N)")
+```
+
+---
+
+# Homogeneización de geometrías {#sec-homogeneizacion}
+
+Un shapefile de cauces puede mezclar geometrías `LINESTRING` (un segmento) y
+`MULTILINESTRING` (varios segmentos agrupados). `st_buffer()` y `st_union()`
+requieren que todas las geometrías sean del mismo tipo; `st_cast()` normaliza
+todo a `MULTILINESTRING` sin pérdida de información.
+
+```{r}
+#| label: homogeneizacion
+
+rios_utm <- st_cast(rios_utm, "MULTILINESTRING")
+message(">>> Geometrías homogeneizadas a MULTILINESTRING")
+```
+
+---
+
+# Buffer de 60 metros {#sec-buffer}
+
+`st_buffer()` genera un polígono que envuelve cada línea del cauce a la distancia
+indicada. Los parámetros `endCapStyle = "ROUND"` y `joinStyle = "ROUND"` producen
+geometrías suaves, más adecuadas para representar zonas de ribera naturales que
+los extremos planos (`FLAT`) o las esquinas angulosas (`MITRE`).
+
+```{r}
+#| label: buffer
+
+rios_buffer_utm <- st_buffer(
+  rios_utm,
+  dist          = 60,      # 60 metros = zona de ribera estimada
+  endCapStyle   = "ROUND", # Extremos redondeados
+  joinStyle     = "ROUND"  # Uniones suaves entre segmentos
+)
+
+message(">>> Buffer de 60 m aplicado")
+```
+
+---
+
+# Disolución de polígonos por río {#sec-disolucion}
+
+Cuando un cauce está representado por múltiples segmentos, el buffer produce
+polígonos parcialmente solapados. `st_union()` dentro de `summarise()` fusiona
+todos los polígonos del mismo río en un único `MULTIPOLYGON`, eliminando
+solapamientos internos y generando una zona de ribera continua.
+
+```{r}
+#| label: disolucion
+
+rios_disueltos <-
+  rios_buffer_utm %>%
+  group_by(nombre) %>%
+  summarise(
+    geometry = st_union(geometry),
+    .groups  = "drop"
+  )
+
+message(">>> Polígonos disueltos: ", nrow(rios_disueltos), " entidades")
+print(rios_disueltos)
+```
+
+---
+
+# Reproyección a WGS84 {#sec-reproyeccion-wgs84}
+
+El formato KML/KMZ exige coordenadas en **EPSG:4326** (WGS84, grados
+decimales). Esta reproyección es obligatoria; sin ella, Google Earth o QGIS
+mostrarán la capa en una posición incorrecta.
+
+```{r}
+#| label: reproyeccion-wgs84
+
+rios_wgs84 <- st_transform(rios_disueltos, crs = 4326)
+message(">>> Reproyectado a WGS84 para exportación KML")
+```
+
+---
+
+# Metadatos y estilos de color {#sec-metadatos}
+
+Añadimos dos columnas auxiliares:
+
+- **`descripcion`:** texto informativo que Google Earth muestra al hacer clic
+  sobre cada polígono.
+- **`OGR_STYLE`:** cadena de estilo que el driver KML de GDAL/OGR interpreta para
+  colorear cada río de forma diferente (azul → Arlanzón, verde → Vena,
+  naranja → Ubierna). El prefijo hexadecimal de 2 dígitos en `fc:` controla la
+  opacidad del relleno (`66` ≈ 40 %).
+
+```{r}
+#| label: metadatos
+
+rios_wgs84 <-
+  rios_wgs84 %>%
+  mutate(
+    descripcion = paste0(
+      "Zona de ribera del río ", nombre,
+      " (buffer 60 m) | Fuente: IGN/CNIG"
+    ),
+    OGR_STYLE = case_when(
+      nombre == "Río Arlanzón"        ~ "BRUSH(fc:#661E90FF);PEN(c:#1E90FF,w:2px)",
+      nombre == "Río Arlanzón (Brazo)"~ "BRUSH(fc:#661E90FF);PEN(c:#1E90FF,w:2px)",
+      nombre == "Río Vena"            ~ "BRUSH(fc:#6632CD32);PEN(c:#32CD32,w:2px)",
+      nombre == "Río Ubierna"         ~ "BRUSH(fc:#66FF8C00);PEN(c:#FF8C00,w:2px)",
+      TRUE                            ~ "BRUSH(fc:#660000FF);PEN(c:#0000FF,w:2px)"
+    )
+  )
+```
+
+---
+
+# Verificación final y visualización {#sec-verificacion}
+
+Antes de exportar, comprobamos la coherencia del objeto: número de entidades,
+nombres incluidos, CRS y extensión espacial. La visualización con `ggplot2` +
+`geom_sf()` permite confirmar visualmente que los buffers tienen la forma y la
+posición esperadas.
+
+```{r}
+#| label: verificacion
+#| fig-cap: "Zonas de ribera (buffer 60 m) de los ríos Arlanzón, Vena y Ubierna"
+
+cat("\n===== RESUMEN FINAL =====\n")
+cat("Número de ríos:", nrow(rios_wgs84), "\n")
+cat("Ríos incluidos:", paste(rios_wgs84$nombre, collapse = ", "), "\n")
+cat("CRS:", st_crs(rios_wgs84)$input, "\n")
+cat("Bounding box:\n")
+print(st_bbox(rios_wgs84))
+
+col_relleno <- c(
+  "Río Arlanzón"        = "#1E90FF",
+  "Río Arlanzón (Brazo)"= "#1E90FF",
+  "Río Vena"            = "#32CD32",
+  "Río Ubierna"         = "#FF8C00"
+)
+
+ggplot() +
+  geom_sf(
+    data     = rios_wgs84,
+    aes(fill = nombre, color = nombre),
+    linewidth = 0.4
+  ) +
+  scale_fill_manual(values  = col_relleno, na.value = "#0000FF") +
+  scale_color_manual(values = col_relleno, na.value = "#0000FF") +
+  coord_sf(expand = FALSE) +
+  theme_minimal() +
+  labs(
+    title    = "Zonas de ribera (buffer 60 m)",
+    subtitle = "Río Arlanzón, brazo, Vena y Ubierna",
+    fill     = "Río",
+    color    = "Río"
+  )
+```
+
+---
+
+# Exportación a KML {#sec-kml}
+
+`st_write()` llama internamente al driver KML de GDAL. El argumento
+`delete_dsn = TRUE` sobreescribe el archivo si ya existe, evitando el error
+*"Layer already exists"* en ejecuciones repetidas. La capa `OGR_STYLE` creada
+en el paso anterior es leída automáticamente por el driver y aplica los colores
+en el KML resultante.
+
+```{r}
+#| label: exportar-kml
+
+ruta_kml <- "rios_burgos_buffer.kml"
+
+st_write(
+  obj        = rios_wgs84,
+  dsn        = ruta_kml,
+  layer      = "rios_burgos_buffer",
+  driver     = "KML",
+  delete_dsn = TRUE
+)
+
+message(">>> KML generado: ", ruta_kml)
+```
+
+---
+
+# Compresión a KMZ {#sec-kmz}
+
+KMZ es simplemente un archivo KML comprimido en ZIP con extensión `.kmz`.
+`zip::zip()` con `mode = "cherry-pick"` incluye solo el archivo KML especificado
+(sin rutas absolutas dentro del ZIP), lo que garantiza compatibilidad con Google
+Earth Pro y la función de importación de QGIS.
+
+```{r}
+#| label: exportar-kmz
+
+ruta_kmz <- "rios_burgos_buffer.kmz"
+
+zip::zip(
+  zipfile = ruta_kmz,
+  files   = ruta_kml,
+  mode    = "cherry-pick"
+)
+
+message(">>> ¡KMZ generado correctamente!: ", ruta_kmz)
+message(">>> Abre en Google Earth Pro o importa en QGIS.")
+```
+
+---
+
+# Resumen del flujo de trabajo {#sec-resumen}
+
+```
+Shapefile IGN/CNIG
+        │
+        ▼
+[1] st_read()          ─── Lectura (opcionalmente filtrada por bbox)
+        │
+        ▼
+[2] filter(grepl())    ─── Selección de Arlanzón, Vena y Ubierna
+        │
+        ▼
+[3] st_transform(25830)─── Proyección métrica (ETRS89 UTM 30N)
+        │
+        ▼
+[4] st_cast(MULTILINE) ─── Homogeneización de geometrías
+        │
+        ▼
+[5] st_buffer(60 m)    ─── Zona de ribera estimada
+        │
+        ▼
+[6] st_union() / group ─── Disolución por río
+        │
+        ▼
+[7] st_transform(4326) ─── Reproyección a WGS84
+        │
+        ▼
+[8] mutate(OGR_STYLE)  ─── Estilos de color para KML
+        │
+        ▼
+[9] st_write() + zip() ─── Exportación KML → KMZ
+```
+
+---
+
+# Información de sesión
+
+```{r}
+#| label: session-info
+#| echo: false
+#| eval: true
+
+sessionInfo()
+```
